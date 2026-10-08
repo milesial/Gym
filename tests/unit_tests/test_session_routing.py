@@ -65,6 +65,7 @@ from nemo_gym.mcp_auto_exposure import TOKEN_HEADER, maybe_auto_expose, session_
 from nemo_gym.server_utils import SESSION_ID_KEY, ServerClient
 from nemo_gym.session_routing import (
     SESSION_CLAIMS_DIR,
+    SESSION_OWNER_HEADER,
     ResourcesSessionLifetimes,
     SessionClaims,
     SessionRoutingMiddleware,
@@ -1108,6 +1109,71 @@ class TestRaces:
         assert response.json() == {"worker": "a", "value": 7}
         # The former claimant served it without claiming the ID again.
         assert _claimant(socket_dir, session_id) is None
+
+
+class TestCheckpointRestores:
+    """A partial-rollout checkpoint restore moves a session to another worker by rewriting its claim."""
+
+    def test_an_old_cookie_follows_its_session_to_the_worker_a_restore_moved_it_to(self, workers, socket_dir) -> None:
+        a, b = workers
+        stored = a.post("/store", json={"value": 7})
+        session_id = a.session(stored)[SESSION_ID_KEY]
+        # The restore installs the session's state on b, which claims it; a drops its own claim.
+        b.server.store[session_id] = a.server.store.pop(session_id)
+        b.app.state.nemo_gym_session_claims.rewrite(session_id)
+        a.app.state.nemo_gym_session_claims.disown(session_id)
+
+        taken = a.post("/take", cookie=stored.cookies[a.cookie_name])
+
+        assert _claimant(socket_dir, session_id) == b.routing_id
+        assert taken.json() == {"worker": "b", "value": 7}
+
+    def test_a_release_after_a_restore_moved_the_claim_leaves_the_new_claim(self, socket_dir: str) -> None:
+        a = Worker("a", socket_dir, close_window_seconds=0.1)
+        b = Worker("b", socket_dir)
+        with a.client, b.client:
+            stored = a.post("/store", json={"value": 7})
+            session_id = a.session(stored)[SESSION_ID_KEY]
+            # b rewrites the claim before a has dropped it, and a's own window then ends.
+            b.app.state.nemo_gym_session_claims.rewrite(session_id)
+            _wait_until(lambda: not a.app.state.nemo_gym_session_claims.mine(session_id))
+
+            assert _claimant(socket_dir, session_id) == b.routing_id
+
+    def test_a_release_cannot_delete_a_claim_a_restore_rewrites_while_it_releases(self, socket_dir: str) -> None:
+        former = SessionClaims(socket_dir, "a" * 32, lambda _: False)
+        holder = SessionClaims(socket_dir, "b" * 32, lambda _: False)
+        assert former.claim("s") == former.routing_id
+        read_claimant = former.claimant
+        rewrites: list[threading.Thread] = []
+
+        def rewritten_right_after_the_check(session_id: str) -> Optional[str]:
+            # The release has found its own claim; the restore on another worker rewrites it now, before the unlink.
+            found = read_claimant(session_id)
+            rewrite = threading.Thread(target=holder.rewrite, args=(session_id,))
+            rewrite.start()
+            rewrites.append(rewrite)
+            # Long enough for the rewrite to finish, unless the release holds it off until it is done.
+            rewrite.join(timeout=0.5)
+            return found
+
+        former.claimant = rewritten_right_after_the_check
+        former.release("s")
+        for rewrite in rewrites:
+            rewrite.join()
+
+        assert rewrites and _claimant(socket_dir, "s") == holder.routing_id
+
+    def test_a_request_without_a_session_goes_to_the_worker_its_header_names(self, agent_workers) -> None:
+        a, b = agent_workers
+
+        named = b.client.get("/whoami", headers={SESSION_OWNER_HEADER: a.routing_id})
+        own = b.client.get("/whoami")
+        gone = b.client.get("/whoami", headers={SESSION_OWNER_HEADER: "0" * 32})
+
+        assert named.json()["worker"] == "a" and own.json()["worker"] == "b"
+        # A worker that is gone, such as one that exited mid-/run, gives a 410 rather than another worker's answer.
+        assert gone.status_code == 410
 
 
 class TestBodies:
