@@ -32,6 +32,7 @@ from uuid import uuid4
 from fastapi import HTTPException, Request
 from pydantic import ConfigDict, Field, PrivateAttr
 
+from nemo_gym.agent_outcome import AgentOutcome
 from nemo_gym.agent_utils.sandbox_session import SandboxSession
 from nemo_gym.agent_utils.task_timeout import AGENT_TIMEOUT_METADATA_KEY, resolve_agent_timeout
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
@@ -42,7 +43,7 @@ from nemo_gym.base_responses_api_agent import (
     AgentSessionState,
     BaseResponsesAPIAgentConfig,
     Body,
-    SimpleResponsesAPIAgent,
+    OutcomeReportingAgent,
 )
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
 from nemo_gym.global_config import get_global_config_dict
@@ -203,8 +204,18 @@ class OpenCodeAgentVerifyResponse(BaseVerifyResponse):
     )
 
 
-class OpenCodeAgent(SimpleResponsesAPIAgent):
+class OpenCodeAgent(OutcomeReportingAgent):
     """Run OpenCode locally or in a borrowed or agent-owned sandbox session."""
+
+    def classify_outcome(self, native_result: Mapping[str, Any]) -> AgentOutcome:
+        """Read OpenCode 1.17.11's native assistant APIError; tested on that version."""
+        error = native_result.get("error") or {}
+        if error.get("name") != "APIError":
+            return AgentOutcome(reason="unknown")
+        status = (error.get("data") or {}).get("statusCode")
+        if type(status) is int and 400 <= status <= 599:
+            return AgentOutcome(reason="model_request_error", status_code=status)
+        return AgentOutcome(reason="unknown")
 
     config: OpenCodeAgentConfig
     _local_setup_task: asyncio.Task[None] | None = PrivateAttr(default=None)
@@ -948,6 +959,19 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             except Exception as exc:
                 error = error or f"OpenCode output parse failed: {exc}"
         result = state.session.cleanup
+        assistants = [m["info"] for m in export.get("messages", []) if m["info"].get("role") == "assistant"]
+        native_result = assistants[-1] if assistants else {}
+        reported_error = (
+            error is None
+            and failure is None
+            and result is not None
+            and result["return_code"] == 1
+            and not result["timed_out"]
+            and not result["error"]
+            and (native_result.get("error") or {}).get("name") == "APIError"
+            and native_result.get("finish") is None
+            and bool(native_result.get("time", {}).get("completed"))
+        )
         runtime = state.runtime_info
         if runtime is None:
             state.observations.gaps.append(ObservationGap(code="runtime_info_unavailable"))
@@ -1013,9 +1037,9 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         )
         if failure is not None:
             raise failure
-        if error:
+        if error and not reported_error:
             raise HTTPException(502, format_sandbox_error(error, stderr=state.stderr))
-        return NeMoGymResponse(
+        response = NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
             created_at=int(time()),
             model=self.config.model_server.name,
@@ -1023,6 +1047,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             output=output,
             usage=usage,
             status=status,
+            error={"code": "server_error", "message": json.dumps(native_result["error"])} if reported_error else None,
             tool_choice=body.tool_choice,
             tools=body.tools,
             parallel_tool_calls=body.parallel_tool_calls,
@@ -1033,6 +1058,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 AGENT_TIMEOUT_METADATA_KEY: str(timeout),
             },
         )
+        return self.report_outcome(response, native_result)
 
 
 if __name__ == "__main__":
