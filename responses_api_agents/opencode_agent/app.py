@@ -46,7 +46,7 @@ from nemo_gym.base_responses_api_agent import (
     SimpleResponsesAPIAgent,
 )
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
-from nemo_gym.failure_kinds import MODEL_REQUEST_ERROR, MODEL_TRANSPORT_ERROR
+from nemo_gym.failure_kinds import AGENT_LIMIT, MODEL_REQUEST_ERROR, MODEL_TRANSPORT_ERROR
 from nemo_gym.global_config import get_global_config_dict
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
@@ -210,17 +210,19 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
 
     @staticmethod
     def _reported_model_error(native_result: Mapping[str, Any], cleanup: dict | None) -> bool:
-        """Recognize a completed APIError, with or without HTTP status; tested on OpenCode 1.17.11.
+        """Recognize a completed API error or context limit; tested on OpenCode 1.17.11.
 
         Independent worker failures, cleanup errors and timeouts are not provider reports.
         """
+        finishes = {"APIError": None, "ContextOverflowError": "error"}
+        name = (native_result.get("error") or {}).get("name")
         return (
             cleanup is not None
             and cleanup["return_code"] == 1
             and not cleanup["timed_out"]
             and not cleanup["error"]
-            and (native_result.get("error") or {}).get("name") == "APIError"
-            and native_result.get("finish") is None
+            and name in finishes
+            and native_result.get("finish") == finishes[name]
             and bool(native_result.get("time", {}).get("completed"))
         )
 
@@ -232,6 +234,8 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         the Environment Server still decides whether to retry the episode.
         """
         error = native_result.get("error") or {}
+        if error.get("name") == "ContextOverflowError":
+            return AgentOutcome(failure_kind=AGENT_LIMIT)
         if error.get("name") != "APIError":
             return AgentOutcome(failure_kind="unknown")
         data = error.get("data") or {}
@@ -988,6 +992,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         assistants = [m["info"] for m in export.get("messages", []) if m["info"].get("role") == "assistant"]
         native_result = assistants[-1] if assistants else {}
         reported_error = error is None and failure is None and self._reported_model_error(native_result, result)
+        context_limit = reported_error and self.classify_outcome(native_result).failure_kind == AGENT_LIMIT
         runtime = state.runtime_info
         if runtime is None:
             state.observations.gaps.append(ObservationGap(code="runtime_info_unavailable"))
@@ -1013,7 +1018,10 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 incomplete = True
             elif finish != "stop" or not last.get("time", {}).get("completed"):
                 error = error or f"OpenCode ended without a successful terminal assistant result (finish={finish!r})"
-        status = "failed" if error or failure else "incomplete" if incomplete else "completed"
+        if context_limit:
+            status = "incomplete"
+        else:
+            status = "failed" if error or failure else "incomplete" if incomplete else "completed"
         # Artifact message completion records a model turn, not the entire invocation.
         for record in state.observations.records:
             if isinstance(record, AgentInvocation) and record.parent_invocation_id is None:
@@ -1021,6 +1029,8 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 record.error_type = (
                     "cancelled"
                     if isinstance(failure, asyncio.CancelledError)
+                    else "context_limit"
+                    if context_limit
                     else "provider_error"
                     if reported_error
                     else "server_error"
@@ -1062,7 +1072,9 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             output=output,
             usage=usage,
             status=status,
-            error={"code": "server_error", "message": json.dumps(native_result["error"])} if reported_error else None,
+            error={"code": "server_error", "message": format_sandbox_error(json.dumps(native_result["error"]))}
+            if reported_error and not context_limit
+            else None,
             tool_choice=body.tool_choice,
             tools=body.tools,
             parallel_tool_calls=body.parallel_tool_calls,
