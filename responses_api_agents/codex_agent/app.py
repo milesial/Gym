@@ -994,6 +994,9 @@ class CodexAgent(SimpleResponsesAPIAgent):
             raise failure
         if error and not reported_model_error:
             raise HTTPException(502, f"Codex execution failed: {error}")
+        terminal = next((event for _, event in reversed(events) if event.get("type") == "turn.failed"), {})
+        if state.model_attempts:
+            terminal = {**terminal, "upstream_attempt": state.model_attempts[-1]}
         response = NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
             created_at=int(time()),
@@ -1002,7 +1005,14 @@ class CodexAgent(SimpleResponsesAPIAgent):
             output=output,
             status=status,
             incomplete_details={"reason": "max_output_tokens"} if output_limited else None,
-            error={"code": "server_error", "message": terminal_error} if reported_model_error else None,
+            error={
+                "code": "rate_limit_exceeded"
+                if self.classify_outcome(terminal).status_code == 429
+                else "server_error",
+                "message": terminal_error,
+            }
+            if reported_model_error
+            else None,
             tool_choice=body.tool_choice,
             tools=body.tools,
             parallel_tool_calls=body.parallel_tool_calls,
@@ -1015,9 +1025,6 @@ class CodexAgent(SimpleResponsesAPIAgent):
             },
         )
 
-        terminal = next((event for _, event in reversed(events) if event.get("type") == "turn.failed"), {})
-        if state.model_attempts:
-            terminal = {**terminal, "upstream_attempt": state.model_attempts[-1]}
         return self.report_outcome(response, terminal)
 
     def _resolve_call_base_url(self, rollout_id: Optional[str]) -> str:
