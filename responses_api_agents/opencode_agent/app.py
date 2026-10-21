@@ -43,7 +43,7 @@ from nemo_gym.base_responses_api_agent import (
     AgentSessionState,
     BaseResponsesAPIAgentConfig,
     Body,
-    OutcomeReportingAgent,
+    SimpleResponsesAPIAgent,
 )
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
 from nemo_gym.global_config import get_global_config_dict
@@ -204,7 +204,7 @@ class OpenCodeAgentVerifyResponse(BaseVerifyResponse):
     )
 
 
-class OpenCodeAgent(OutcomeReportingAgent):
+class OpenCodeAgent(SimpleResponsesAPIAgent):
     """Run OpenCode locally or in a borrowed or agent-owned sandbox session."""
 
     def classify_outcome(self, native_result: Mapping[str, Any]) -> AgentOutcome:
