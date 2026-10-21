@@ -19,6 +19,7 @@ from environment_servers.harbor.app import (
     roll_up_turns,
 )
 from environment_servers.harbor.tests.conftest import TASK_TOML, FakeSandbox, agent_response, make_server
+from nemo_gym.tasks.harbor import load_task
 from nemo_gym.tasks.harbor.materialize import STEP_METADATA_KEY, materialize_task
 
 
@@ -319,6 +320,282 @@ async def test_a_step_verifier_user_with_a_group_follows_the_provider_at_seed(tm
         # Nothing ran: no sandbox, no agent session, no turn.
         assert created == [] and sandbox.execs == [] and server.server_client.seed_bodies() == []
         assert runs == [] and response.result is None
+
+
+def solution_uploads(sandbox: FakeSandbox) -> list[dict]:
+    return [c for c in sandbox.execs if "tar -xzf" in c["command"] and "-C /solution" in c["command"]]
+
+
+def write_step_solution(task_dir: Path, name: str, script: str) -> None:
+    (task_dir / "steps" / name / "solution").mkdir(parents=True, exist_ok=True)
+    (task_dir / "steps" / name / "solution" / "solve.sh").write_text(script)
+
+
+async def test_the_oracle_gets_each_steps_own_solution_before_its_turn(tmp_path, monkeypatch):
+    """G7 round 24, attempt 4: the MemoryArena task keeps its reference solutions in `steps/<name>/solution/` and
+    the server uploaded the task's top-level `solution/` once at seed, so the oracle had nothing to run. Harbor
+    0.22.0's oracle resolves the step's own folder per step and falls back to the task's (`agents/oracle.py`
+    `_resolve_solution_paths`); the server now places that folder at /solution before each turn, emptying what the
+    previous turn left, so each turn's `/solution/solve.sh` is its step's and a step without any leaves none."""
+    steps = '[[steps]]\nname = "plan"\n[[steps]]\nname = "build"\n[[steps]]\nname = "check"\n'
+    task_dir = tmp_path / "datasets" / "ds" / "hello"
+    write_steps(task_dir, {"plan": "P", "build": "B", "check": "C"})
+    write_step_solution(task_dir, "plan", "#!/bin/bash\necho plan\n")
+    write_step_solution(task_dir, "check", "#!/bin/bash\necho check\n")
+    # No top-level solution/: `build` has none anywhere; the loader reads the folder as it is.
+    server, task, sandbox, _ = make_server(
+        tmp_path, monkeypatch, toml=TASK_TOML + steps, agent_implementation="harbor_oracle_agent"
+    )
+    assert not task.has_solution and not (task.path / "solution").exists()
+    uploads_per_turn: list[int] = []
+    server.server_client.turn_hooks.append(lambda: uploads_per_turn.append(len(solution_uploads(sandbox))))
+
+    response = await server.run_request(request_for(task))
+
+    assert response.failure is None, response.failure
+    assert [turn.name for turn in response.result.turns] == ["plan", "build", "check"]
+    # Nothing at seed; one upload before the first turn and before the third, none for the step without a solution.
+    assert uploads_per_turn == [1, 1, 2]
+    assert [data.decode() for data in uploaded_files(sandbox, "solve.sh")] == [
+        "#!/bin/bash\necho plan\n",
+        "#!/bin/bash\necho check\n",
+    ]
+    uploads = solution_uploads(sandbox)
+    assert all(upload["user"] == "root" and "chmod -R a+rX /solution" in upload["command"] for upload in uploads)
+    # /solution is emptied before every turn, as root, so `build` runs with no previous step's script in place.
+    resets = [i for i, c in enumerate(sandbox.execs) if c["command"] == "rm -rf -- /solution"]
+    assert len(resets) == 3 and all(sandbox.execs[i]["user"] == "root" for i in resets)
+    upload_indexes = [i for i, c in enumerate(sandbox.execs) if c in uploads]
+    assert resets[0] < upload_indexes[0] < resets[1] < resets[2] < upload_indexes[1]
+
+    # The task's top-level solution/ stands in for a step without its own, as Harbor's oracle falls back to it.
+    (task.path / "solution").mkdir()
+    (task.path / "solution" / "solve.sh").write_text("#!/bin/bash\necho task\n")
+    task = load_task(task.path)
+    server.config.tasksets["ds"].tasks["hello"] = task.digest
+    assert task.has_solution
+    sandbox.execs.clear()
+    sandbox.uploaded_archives.clear()
+    response = await server.run_request(request_for(task, rollout="r2"))
+    assert response.failure is None, response.failure
+    assert [data.decode() for data in uploaded_files(sandbox, "solve.sh")] == [
+        "#!/bin/bash\necho plan\n",
+        "#!/bin/bash\necho task\n",
+        "#!/bin/bash\necho check\n",
+    ]
+
+
+async def test_other_harnesses_never_get_a_steps_solution(tmp_path, monkeypatch):
+    steps = '[[steps]]\nname = "plan"\n[[steps]]\nname = "build"\n'
+    task_dir = tmp_path / "datasets" / "ds" / "hello"
+    write_steps(task_dir, {"plan": "P", "build": "B"})
+    write_step_solution(task_dir, "plan", "#!/bin/bash\necho plan\n")
+    server, task, sandbox, _ = make_server(
+        tmp_path, monkeypatch, toml=TASK_TOML + steps, agent_implementation="hermes_agent"
+    )
+
+    response = await server.run_request(request_for(task))
+
+    assert response.failure is None, response.failure
+    assert not any("/solution" in c["command"] for c in sandbox.execs)
+    assert uploaded_files(sandbox, "solve.sh") == []
+
+
+TWO_USERS = """
+[[steps]]
+name = "plan"
+
+[[steps]]
+name = "build"
+[steps.agent]
+user = "builder"
+
+[[steps]]
+name = "check"
+[steps.agent]
+user = 1000
+"""
+
+
+async def test_each_turn_runs_as_its_steps_agent_user(tmp_path, monkeypatch):
+    """Harbor runs each step as its own `[steps.agent].user` (else the task's `[agent].user`): the sandbox's
+    default user, the working directory's owner and the user the harness is handed switch with the turn, once,
+    when the step's user differs from the one in place; a numeric uid is resolved to its name as at seed, and a
+    step without a user runs as the task's. The verifier keeps its own fallback (the task image's user)."""
+    server, task, sandbox, _ = multi_turn_server(
+        tmp_path,
+        monkeypatch,
+        TWO_USERS,
+        {"plan": "P", "build": "B", "check": "C"},
+        agent_implementation="harbor_oracle_agent",
+    )
+    write_step_solution(task.path, "plan", "#!/bin/bash\necho plan\n")
+    task = load_task(task.path)
+    server.config.tasksets["ds"].tasks["hello"] = task.digest
+    users_at_turn: list = []
+    server.server_client.turn_hooks.append(lambda: users_at_turn.append(sandbox.default_user))
+
+    response = await server.run_request(request_for(task))
+
+    assert response.failure is None, response.failure
+    assert [turn.name for turn in response.result.turns] == ["plan", "build", "check"]
+    # The task's user is root (no [agent].user, a root image): the first turn keeps the image's default.
+    assert users_at_turn == [None, "builder", "agent"]
+    assert [seed["sandbox_access"].get("user") for seed in server.server_client.seed_bodies()] == [
+        None,
+        "builder",
+        "agent",
+    ]
+    # The working directory is handed to each new user as root, after the seed's own mkdir.
+    chowns = [c for c in sandbox.execs if c["command"].startswith("chown ")]
+    assert [(c["command"], c["user"]) for c in chowns] == [
+        ("chown builder /app", "root"),
+        ("chown agent /app", "root"),
+    ]
+    # test.sh never runs as the step's agent user: the verifier keeps its own user (the image's, here plain root,
+    # which is the facade's `None` path), not `builder` or the uid.
+    runs = [c for c in sandbox.execs if "bash /tests/test.sh" in c["command"]]
+    assert [run["user"] for run in runs] == [None, None, None]
+    # The uid was looked up once, by name, as root.
+    lookups = [c for c in sandbox.execs if c["command"].startswith("getent passwd 1000")]
+    assert len(lookups) == 1
+    # A step solution placed for the first turn was uploaded before any switch; the switch leaves it readable.
+    assert uploaded_files(sandbox, "solve.sh") == [b"#!/bin/bash\necho plan\n"]
+
+
+async def test_consecutive_steps_with_the_same_user_switch_once_and_a_later_step_switches_back(tmp_path, monkeypatch):
+    steps = (
+        TASK_TOML.replace("[agent]\n", '[agent]\nuser = "agent"\n')
+        + '[[steps]]\nname = "a"\n[steps.agent]\nuser = "builder"\n'
+        + '[[steps]]\nname = "b"\n[steps.agent]\nuser = "builder"\n'
+        + '[[steps]]\nname = "c"\n'
+    )
+    task_dir = tmp_path / "datasets" / "ds" / "hello"
+    write_steps(task_dir, {"a": "A", "b": "B", "c": "C"})
+    server, task, sandbox, _ = make_server(tmp_path, monkeypatch, toml=steps)
+    assert task.user == "agent"
+    users_at_turn: list = []
+    server.server_client.turn_hooks.append(lambda: users_at_turn.append(sandbox.default_user))
+
+    response = await server.run_request(request_for(task))
+
+    assert response.failure is None, response.failure
+    assert users_at_turn == ["builder", "builder", "agent"]
+    chowns = [c["command"] for c in sandbox.execs if c["command"].startswith("chown ") or "&& chown " in c["command"]]
+    # The seed's own hand-over to the task user, then one per switch: to builder before `a`, back to agent before `c`.
+    assert chowns == ["mkdir -p /app && chown agent /app", "chown builder /app", "chown agent /app"]
+
+
+@pytest.mark.parametrize("provider", ["docker", "opensandbox"])
+async def test_a_step_agent_user_with_a_group_follows_the_provider_at_seed(tmp_path, monkeypatch, provider):
+    """A step's `[steps.agent].user = "name:group"` is as static as the task's own: Docker's `--user` takes the
+    pair, every other provider switches user by name only, so the pair is refused at seed there, naming the step,
+    before any turn is paid for (the rule M16/M20 set for the task's `[agent].user`)."""
+    steps = '[[steps]]\nname = "plan"\n[[steps]]\nname = "build"\n[steps.agent]\nuser = "builder:grp"\n'
+    server, task, sandbox, created = multi_turn_server(tmp_path, monkeypatch, steps, {"plan": "P", "build": "B"})
+    monkeypatch.setattr(
+        "environment_servers.harbor.sandboxes.get_global_config_dict", lambda: {"sandbox": {provider: {}}}
+    )
+
+    response = await server.run_request(request_for(task))
+
+    if provider == "docker":
+        assert response.failure is None, response.failure
+        assert [turn.name for turn in response.result.turns] == ["plan", "build"]
+        assert sandbox.default_user == "builder:grp"
+        assert server.server_client.seed_bodies()[1]["sandbox_access"]["user"] == "builder:grp"
+    else:
+        failure = response.failure
+        assert failure is not None and failure.stage == "seed" and failure.terminal
+        assert "hello step 'build': user 'builder:grp' names group 'grp'" in failure.failure_reason
+        assert created == [] and sandbox.execs == [] and server.server_client.seed_bodies() == []
+
+
+LONG_STEPS = """
+[[steps]]
+name = "plan"
+[steps.agent]
+timeout_sec = 0.3
+[steps.verifier]
+timeout_sec = 0.3
+
+[[steps]]
+name = "build"
+[steps.agent]
+timeout_sec = 0.3
+[steps.verifier]
+timeout_sec = 0.3
+"""
+
+
+async def test_a_multi_step_task_longer_than_the_default_gets_its_own_budget(tmp_path, monkeypatch, caplog):
+    """G7 round 24: MemoryArena's six steps budget 21 780 s, above `default_episode_timeout_seconds` (21 600), and
+    the seed only warned, so a real run would be cut off at the default and retried, never scored. With
+    `enforce_task_timeouts` the episode deadline and the sandbox lifetime now follow the task's own budget when it
+    is the longer one, the way the single-turn path already derives the deadline from the task."""
+    server, task, sandbox, _ = multi_turn_server(
+        tmp_path,
+        monkeypatch,
+        LONG_STEPS,
+        {"plan": "P", "build": "B"},
+        default_episode_timeout_seconds=0.1,
+        harness_setup_allowance_s=0,
+        verifier_grace_s=0,
+        sandbox_ready_timeout_s=1,
+    )
+    # Two turns of 0.3 + 0.3 s plus one sandbox start: well above the run-wide default of 0.1 s.
+    assert server._turns_budget_s(task) == pytest.approx(1.2)
+    assert server._task_budget_s(task) == pytest.approx(2.2)
+    assert server._episode_budget_s(task) == pytest.approx(2.2)
+    assert await server.episode_timeout_seconds(request_for(task)) == pytest.approx(2.2)
+    # A single-turn task keeps the run-wide cap.
+    single_server, single_task, _, _ = make_server(
+        tmp_path / "single", monkeypatch, default_episode_timeout_seconds=0.1
+    )
+    assert single_server._episode_budget_s(single_task) == 0.1
+    assert await single_server.episode_timeout_seconds(request_for(single_task)) == 0.1
+    # The harness takes 0.5 s per turn: over the default, within the task's budget, so both turns are scored.
+    server.server_client.slow_path = "/ng-rollout/r1/v1/responses"
+    with caplog.at_level("WARNING"):
+        response = await server.run_request(request_for(task))
+    assert response.failure is None, response.failure
+    assert [turn.name for turn in response.result.turns] == ["plan", "build"] and response.result.reward == 1.0
+    assert (
+        "above default_episode_timeout_seconds=0; the episode deadline and the sandbox lifetime follow" in caplog.text
+    )
+    # The derived deadline is the task's own budget, not a blank cheque: `test_the_task_deadline_ends_an_overrunning_turn`
+    # keeps the task deadline firing on a turn that runs past it.
+
+
+async def test_without_enforcement_a_multi_step_task_longer_than_the_default_is_refused_naming_the_setting(
+    tmp_path, monkeypatch
+):
+    server, task, sandbox, created = multi_turn_server(
+        tmp_path,
+        monkeypatch,
+        LONG_STEPS,
+        {"plan": "P", "build": "B"},
+        default_episode_timeout_seconds=0.1,
+        verifier_grace_s=0,
+        enforce_task_timeouts=False,
+    )
+    assert server._episode_budget_s(task) == 0.1 and await server.episode_timeout_seconds(request_for(task)) == 0.1
+
+    response = await server.run_request(request_for(task))
+
+    failure = response.failure
+    assert failure is not None and failure.stage == "seed" and failure.terminal
+    assert "its 2 steps budget up to 1s" in failure.failure_reason
+    assert (
+        "default_episode_timeout_seconds=0" in failure.failure_reason
+        and "enforce_task_timeouts" in failure.failure_reason
+    )
+    assert "raise default_episode_timeout_seconds to at least 1" in failure.failure_reason
+    assert created == [] and sandbox.execs == [] and server.server_client.seed_bodies() == []
+    # A default that covers the steps runs them without enforcement, as before.
+    server.config.default_episode_timeout_seconds = 5
+    response = await server.run_request(request_for(task, rollout="r2"))
+    assert response.failure is None and [turn.name for turn in response.result.turns] == ["plan", "build"]
 
 
 async def test_a_forced_separate_verifier_is_refused_at_seed_for_a_multi_step_task(tmp_path, monkeypatch):

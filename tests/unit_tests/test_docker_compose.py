@@ -2678,3 +2678,51 @@ async def test_log_paths_are_prepared_when_the_provider_returns_no_stdout(tmp_pa
             await make_compose(NoStdoutShellProvider(), document, poll_interval_s=0.01).start()
     finally:
         adapter.LOGS_TREE = original
+
+
+@pytest.mark.asyncio
+async def test_an_unhealthy_service_failure_carries_the_tail_of_its_command_log(tmp_path):
+    """G7 round 24: a sidecar whose process died at start (a WebShop catalog that did not fit its memory) failed
+    the group as `Compose service 'mcp-server' unhealthy: exit status 1`, the healthcheck's own words, and the
+    adapter kept nothing of what the service had printed, so the cause had to be inferred from the next attempt.
+    The failure now carries a bounded tail of the service's command log (stdout and stderr of its command), as the
+    failure of a service that exited does; a service whose command printed nothing says so."""
+    provider = ShellProvider()
+    chatty = {
+        "image": "image",
+        "command": ["sh", "-c", "echo loading catalog; echo 'MemoryError: cannot allocate 7 GiB' >&2; sleep 5"],
+        "healthcheck": {"test": ["CMD", "false"], "retries": 1, "interval": "1ms"},
+    }
+    group = make_compose(
+        provider,
+        {
+            "services": {
+                "mcp-server": chatty,
+                "main": {"image": "image", "depends_on": {"mcp-server": {"condition": "service_healthy"}}},
+            }
+        },
+        default_command=["sleep", "5"],
+        poll_interval_s=0.01,
+    )
+    with pytest.raises(RuntimeError, match="unhealthy") as failure:
+        async with group:
+            pass
+    message = str(failure.value)
+    assert message.startswith("Compose service 'mcp-server' unhealthy: ")
+    assert "last output of its command: loading catalog\nMemoryError: cannot allocate 7 GiB" in message
+
+    quiet = {**chatty, "command": ["sleep", "5"]}
+    group = make_compose(
+        provider,
+        {
+            "services": {
+                "mcp-server": quiet,
+                "main": {"image": "image", "depends_on": {"mcp-server": {"condition": "service_healthy"}}},
+            }
+        },
+        default_command=["sleep", "5"],
+        poll_interval_s=0.01,
+    )
+    with pytest.raises(RuntimeError, match="unhealthy: .*; its command wrote no output$"):
+        async with group:
+            pass

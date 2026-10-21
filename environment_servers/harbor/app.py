@@ -360,6 +360,8 @@ class HarborEnvironmentServer(
         self._snapshots = tempfile.TemporaryDirectory(prefix="nemo-gym-harbor-tasks-")
         # Built or declared verifier images found without /tests/test.sh, each warned about once.
         self._verifier_images_without_tests: set[str] = set()
+        # Task digests whose Compose sidecars without deploy.resources were warned about once (`_warn_unsized_sidecars`).
+        self._unsized_sidecars_warned: set[str] = set()
         self._pull_retry_gate = asyncio.Semaphore(PULL_RETRY_CONCURRENCY)
         self._shutting_down = False
         artifacts = self.config.artifacts_dir
@@ -538,12 +540,48 @@ class HarborEnvironmentServer(
                 budget += task.config.environment.build_timeout_sec
         return budget
 
+    def _turns_budget_s(self, task: HarborTask) -> float:
+        """What a multi-step task's steps alone add up to: every step's agent and verifier budget with the
+        verifier grace, the sum the seed compares with ``default_episode_timeout_seconds``."""
+        return sum(
+            task.config.step_agent_timeout_sec(turn.config)
+            + task.config.step_verifier_timeout_sec(turn.config)
+            + self.config.verifier_grace_s
+            for turn in task.turns
+        )
+
     def _episode_budget_s(self, task: HarborTask) -> float:
-        """Wall time one episode of this task may take: its own budget when enforced, within the run-wide deadline."""
+        """Wall time one episode of this task may take: its own budget when enforced, within the run-wide deadline.
+
+        A multi-step task is the exception to the cap: its steps may add up to more than
+        ``default_episode_timeout_seconds`` (six steps of 1800 s agent and verifier time already do), and an
+        episode cut off at the default would be retried, never scored, so with ``enforce_task_timeouts`` its
+        budget is the task's own even above the default (:meth:`episode_timeout_seconds` raises the episode
+        deadline to match). Without enforcement the seed refuses such a task (:meth:`_seed`).
+        """
         default = self.config.default_episode_timeout_seconds
         if not self.config.enforce_task_timeouts:
             return default
-        return min(default, self._task_budget_s(task))
+        budget = self._task_budget_s(task)
+        if task.turns and budget > default:
+            return budget
+        return min(default, budget)
+
+    async def episode_timeout_seconds(self, request: HarborEpisodeRequest) -> float:
+        """The episode's wall-clock bound: ``default_episode_timeout_seconds``, raised to the task's own budget
+        for a multi-step task whose steps add up to more (see :meth:`_episode_budget_s`), so the deadline the
+        base server opens matches the sandbox lifetime. A task that does not resolve keeps the default; the
+        seed reports why."""
+        default = self.config.default_episode_timeout_seconds
+        if not self.config.enforce_task_timeouts:
+            return default
+        try:
+            task = await self._resolve_task(request.task.task_id, request.task.task_input.task_data)
+        except Exception:
+            return default
+        if not task.turns:
+            return default
+        return max(default, self._task_budget_s(task))
 
     # -- the episode -----------------------------------------------------------------------
 
@@ -840,8 +878,10 @@ class HarborEnvironmentServer(
 
         Each turn opens a fresh agent session (Harbor's default, ``resume_trajectory = false``), sends the
         step's instruction, closes the session and runs the step's verifier: the task's ``tests/`` with
-        ``steps/<name>/tests/`` on top. The episode stops after a turn that is masked, produces no verifier
-        result, or misses its ``min_reward``; the remaining turns do not run.
+        ``steps/<name>/tests/`` on top. Before a turn the sandbox takes the step's ``[steps.agent].user`` when
+        it has one and the oracle gets the step's own solution (:meth:`_prepare_turn`). The episode stops
+        after a turn that is masked, produces no verifier result, or misses its ``min_reward``; the remaining
+        turns do not run.
         """
         task = session.task
         inputs = request.task.task_input.turns
@@ -857,6 +897,21 @@ class HarborEnvironmentServer(
         results: list[HarborTurnResult] = []
         stopped_after: str | None = None
         for turn, turn_input in zip(task.turns, inputs):
+            try:
+                access = await self._prepare_turn(session, turn, access)
+            except HTTPException as error:
+                raise self._failure(
+                    stage="agent",
+                    failure_reason=f"turn {turn.name!r}: {error.detail}",
+                    terminal=error.status_code < 500,
+                ) from error
+            except Exception as error:
+                # The sandbox could not take the turn's user or solution: a provider-side failure, retried elsewhere.
+                raise self._failure(
+                    stage="agent",
+                    failure_reason=f"turn {turn.name!r}: {type(error).__name__}: {error}",
+                    terminal=False,
+                ) from error
             response, observations, trajectory = await self._agent_turn(
                 request,
                 access,
@@ -907,6 +962,35 @@ class HarborEnvironmentServer(
             **roll_up_turns(results, strategy),
         )
         return HarborEpisodeResponse(episode_id=request.episode_id, task_id=request.task.task_id, result=episode)
+
+    async def _prepare_turn(self, session: HarborSession, turn: HarborTurn, access: SandboxAccess) -> SandboxAccess:
+        """What a turn needs in place before its agent session opens: the step's user and the step's solution.
+
+        Harbor runs each step as its own ``[steps.agent].user`` (else the task's ``[agent].user``), so when the
+        turn's user differs from the one the sandbox runs as, the sandbox's default user, the working directory's
+        owner and the user the harness is handed switch to it (:meth:`_apply_turn_user`), and the access the
+        harness gets is rebuilt for it; the verifier keeps its own user and fallback. The oracle alone then gets
+        the step's ``solution/`` at ``/solution`` (:meth:`_place_turn_solution`).
+        """
+        task = session.task
+        user = str(turn.config.agent.user) if turn.config.agent.user is not None else task.user
+        if user != session.agent_user:
+            await self._apply_turn_user(session, user)
+            access = await self._sandbox_access(session)
+        await self._place_turn_solution(session, turn)
+        return access
+
+    async def _apply_turn_user(self, session: HarborSession, user: str | None) -> None:
+        """Switch the episode's sandbox to ``user`` for the turns that follow: the default of every exec that
+        names no user (a numeric uid resolved to its name, as at seed), the working directory's owner, and the
+        user the harness runs as. A ``name:group`` pair was refused at seed on a provider that cannot apply it."""
+        task = session.task
+        await self._set_default_user(session.sandbox, task, session.user_names, user=user)
+        # The sandbox now runs as the resolved form of the step's user (a uid resolved to its name, as at seed);
+        # the working directory and the harness's own access follow the same value, so the oracle runs as it too.
+        resolved = session.sandbox.default_user
+        await self._own_workdir(session.sandbox, session.workdir, resolved if resolved is None else str(resolved))
+        session.agent_user = None if resolved is None else str(resolved)
 
     def _task_tool_accesses(self, task: HarborTask) -> list[ToolAccess]:
         """The task's MCP servers as agent tool grants, when ``task_mcp_grants`` asks for them.
@@ -972,6 +1056,9 @@ class HarborEnvironmentServer(
         self._refuse_verifier_group(task)
         for turn in task.turns:
             resolve_env_templates(turn.config.verifier.env)
+            # A step's own agent user is installed for its turn (`_apply_turn_user`); a pair the provider cannot
+            # apply is refused before the earlier turns are paid for, as the task's own `[agent].user` is.
+            self._refuse_unsupported_group(task, turn.config.agent.user, where=f" step {turn.name!r}")
         if task.needs_compose:
             # A Compose file the deployment leaves incomplete (a variable no compose_variables entry sets) is a
             # configuration error: refused before anything is provisioned, and not retried.
@@ -980,17 +1067,26 @@ class HarborEnvironmentServer(
             except ImageConfigError as exc:
                 raise HTTPException(422, f"Compose file of task {task.task_id!r}: {exc}") from exc
         if task.turns:
-            budget = sum(
-                task.config.step_agent_timeout_sec(turn.config)
-                + task.config.step_verifier_timeout_sec(turn.config)
-                + self.config.verifier_grace_s
-                for turn in task.turns
-            )
-            if budget > self.config.default_episode_timeout_seconds:
-                # An expired episode is retried, not scored, so a task this long may never finish here.
+            budget = self._turns_budget_s(task)
+            default = self.config.default_episode_timeout_seconds
+            if budget > default and not self.config.enforce_task_timeouts:
+                # Nothing derives a longer deadline without enforcement: an episode cut off at the default is
+                # retried, never scored, so the task is refused with the setting named rather than run short.
+                raise HTTPException(
+                    422,
+                    f"Task {task.task_id!r}: its {len(task.turns)} steps budget up to {budget:.0f}s of agent and "
+                    f"verifier time, above default_episode_timeout_seconds={default:.0f}, and enforce_task_timeouts is "
+                    f"off, so the episode would be cut short and retried; raise default_episode_timeout_seconds to at "
+                    f"least {budget:.0f}, or set enforce_task_timeouts: true to give the episode the task's own budget",
+                )
+            if budget > default:
+                # Once per episode of such a task, at WARNING so the run's log shows which tasks run above the
+                # run-wide default (a notable operational fact, not an error): the deadline and the sandbox
+                # lifetime follow the task's own budget, so the episode is not cut short and retried.
                 LOGGER.warning(
                     f"{task.task_id}: its turns budget up to {budget:.0f}s of agent and verifier time, above "
-                    f"default_episode_timeout_seconds={self.config.default_episode_timeout_seconds:.0f}"
+                    f"default_episode_timeout_seconds={default:.0f}; the episode deadline and the sandbox lifetime "
+                    f"follow the task's own budget ({self._task_budget_s(task):.0f}s)"
                 )
         if self._shutting_down:
             raise HTTPException(503, "Environment server is shutting down")
@@ -1026,6 +1122,7 @@ class HarborEnvironmentServer(
                 session_id=episode_key,
                 provider_ref=self._provider_ref(task),
                 compose=compose,
+                agent_user=task.user,
             )
             # A Compose group ran the overlay on main inside its start, before main's uploads and command.
             if compose is not None:
@@ -1033,6 +1130,7 @@ class HarborEnvironmentServer(
             else:
                 names = await self._apply_overlay(sandbox, task)
             await self._set_default_user(sandbox, task, names)
+            session.user_names = names
             image_user = await self._image_user_name(sandbox, task, names)
             # The working directory and /logs exist before the entrypoint starts, as Harbor's bind mounts do. For a
             # Compose group the adapter already created the /logs paths main bound, before its command; this mkdir

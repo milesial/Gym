@@ -343,6 +343,53 @@ class TestRegistryClient:
         token_request = next(headers for url, headers in registry.requests if url.startswith("https://auth.example"))
         assert token_request["Authorization"] == "Basic dXNlcjpzZWNyZXQ="
 
+    def test_image_prefix_auth_is_turned_into_host_keyed_credentials(self):
+        """A sandbox provider's `images.auth` maps an image prefix to {username, password}; prepare reads private
+        images with the same, so the map is keyed by registry host the way Docker reads a reference (G7 round 24:
+        prepare's registry client was anonymous and a private GitLab sidecar stopped prepare with HTTP 403)."""
+        from nemo_gym.tasks.harbor.registry import credentials_for_image_prefixes
+
+        assert credentials_for_image_prefixes(None) == {}
+        assert credentials_for_image_prefixes({}) == {}
+        creds = credentials_for_image_prefixes(
+            {
+                "registry.example.com:5005/": {"username": "u", "password": "p"},
+                "docker.io/org/": {"username": "du", "password": "dp"},
+                "localhost:5000/": {"username": "lu", "password": "lp"},
+            }
+        )
+        assert creds == {
+            "registry.example.com:5005": ("u", "p"),
+            "registry-1.docker.io": ("du", "dp"),
+            "localhost:5000": ("lu", "lp"),
+        }
+        # A client built from it sends the credentials of the prefix's host as Basic auth at the token challenge.
+
+    def test_several_prefixes_of_one_host_fold_to_one_entry_and_a_clash_warns(self, caplog):
+        from nemo_gym.tasks.harbor.registry import credentials_for_image_prefixes
+
+        same = credentials_for_image_prefixes(
+            {
+                "reg.example/a/": {"username": "u", "password": "p"},
+                "reg.example/b/": {"username": "u", "password": "p"},
+            }
+        )
+        assert same == {"reg.example": ("u", "p")}
+        with caplog.at_level("WARNING", logger="nemo_gym.tasks.harbor.registry"):
+            clash = credentials_for_image_prefixes(
+                {
+                    "reg.example/a/": {"username": "u", "password": "p"},
+                    "reg.example/bb/": {"username": "u2", "password": "p2"},
+                }
+            )
+        # The shorter prefix (the host's broadest rule) wins; the clash is named.
+        assert clash == {"reg.example": ("u", "p")}
+        assert "different credentials" in caplog.text and "reg.example" in caplog.text
+        with pytest.raises(ValueError, match="must hold a `username`"):
+            credentials_for_image_prefixes({"reg.example/": {"username": "u"}})
+        with pytest.raises(ValueError, match="must map an image prefix"):
+            credentials_for_image_prefixes(["reg.example/"])
+
     def test_an_index_without_linux_amd64_is_rejected(self, registry):
         with pytest.raises(ImageConfigError, match="no linux/amd64 manifest"):
             RegistryClient().image_config("redis:arm-only")

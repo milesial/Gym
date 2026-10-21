@@ -98,11 +98,16 @@ without `resume_trajectory`: a fresh agent session per turn, with the step's
 as its budget. The task's top-level `instruction.md` is never sent; a multi-step task may keep material there
 the agent must not see. After each turn the shared verifier runs the task's `tests/` with
 `steps/<name>/tests/` on top, under the step's verifier timeout, user and environment over the task's. A step's
-`[steps.verifier].user` that names a group (`name:group`, `uid:gid`) is refused at seed on every provider but
-Docker, as the task's `[verifier].user` is, before any sandbox exists. Every turn's agent runs as the task's
-user (`[agent].user`, else the image's `USER`): Harbor switches to a step's own `[steps.agent].user` per step,
-which is not applied here yet, so a step that sets one is refused by the loader, by step name, instead of
-being run as the wrong user.
+`[steps.verifier].user` or `[steps.agent].user` that names a group (`name:group`, `uid:gid`) is refused at seed
+on every provider but Docker, as the task's own users are, naming the step, before any sandbox exists. Each turn's
+agent runs as the step's `[steps.agent].user` (else the task's `[agent].user`, else the image's `USER`), as Harbor
+runs each step: when a step's user differs from the one in place, the sandbox's default exec user, the working
+directory's owner and the user the harness is handed switch to it (a numeric uid resolved to its name, as at seed)
+and switch back for a later step that sets a different one; the verifier keeps its own user. The oracle gets the
+step's own `steps/<name>/solution/` at `/solution` before each turn (falling back to the task's top-level
+`solution/`), as Harbor's oracle resolves each step's solution, so `gym dataset validate` runs a task whose
+solutions are per step; such a task counts as validatable when every step has a solution (its own or the task's),
+and is listed unvalidated otherwise.
 
 The episode stops after a turn that is masked, writes no valid reward file, or misses the step's
 `min_reward` (a number gates `reward`, a table gates each named key). `multi_step_reward_strategy` rolls the
@@ -117,8 +122,16 @@ artifacts, agent user and separate verification are refused by the loader, and `
 is refused at seed for such a task. Each turn is seeded with its step's agent budget and hands the verifier an
 ATIF transcript of its own request; with `enforce_task_timeouts` the task deadline sums every turn's harness
 setup, agent budget, hooks and verifier time. A long task's turns can budget more than
-`default_episode_timeout_seconds`; the seed logs a warning, because an expired episode is retried rather than
-scored.
+`default_episode_timeout_seconds`. With `enforce_task_timeouts` the episode deadline and the sandbox lifetime
+then follow the task's own budget (an expired episode is retried, never scored, so the default would cut it off);
+the seed logs this once at INFO level. With `enforce_task_timeouts: false` nothing derives a longer deadline, so
+such a task is refused at seed naming the setting: raise `default_episode_timeout_seconds` to at least the steps'
+total, or turn enforcement on. A multi-step task's Compose sidecar without `deploy.resources` runs at the sandbox
+provider's default size (under Harbor's `docker compose` it has the host's resources); the seed logs, once per
+task, which sidecars run at the default and where a size goes (`deploy.resources.limits` in the task's Compose
+file, or the deployment's job-level overlay), and a sidecar whose process dies at start fails the group with a
+bounded tail of its command log, not only `unhealthy: exit status 1`. See the multi-step tasks docs page under
+`fern/versions/latest/pages/data/` for the full per-turn contract.
 
 ## Dockerfile builds
 
@@ -463,6 +476,13 @@ that image, or ship a `tests/Dockerfile` so the verifier gets an image of its ow
 for what this layer supports).
 
 ## Compose tasks on OpenSandbox
+
+A private image (a Compose sidecar on a private registry, a private base image) is recorded at prepare with the
+credentials the sandbox block's `images.auth` holds, the same ones the provider pulls it with at seed: prepare
+reads `sandbox.<provider>.images.auth` (image prefix to `{username, password}`, resolved so a `${...}`
+interpolates from `env.yaml`), keys it by registry host, and records with it, so a private image no longer stops
+`gym dataset validate` or `gym eval run` at prepare with an anonymous `HTTP 403`. No `images.auth` keeps the
+anonymous reads. Add no new key for this; it is the one place a deployment names registry credentials.
 
 The shipped `nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml` (what `--sandbox opensandbox`
 loads) has no networking block, and the Compose adapter refuses to start a group without one. Put an overlay

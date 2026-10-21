@@ -832,7 +832,15 @@ class AsyncSandboxCompose:
             if not in_start_period:
                 failures += 1
                 if failures >= health.get("retries", 3):
-                    raise RuntimeError(f"Compose service {name!r} unhealthy: {detail}")
+                    # The healthcheck's own output rarely says why (a connection refused is "exit status 1"); the
+                    # service's command log, which the run script redirects stdout and stderr to, usually does. A
+                    # bounded tail of it travels with the failure, as it does for a service that exited.
+                    log = await self.services[name].exec(f"tail -c 4096 {plan['runtime']}/log")
+                    output = (log.stdout or "").strip() if log.return_code == 0 else ""
+                    raise RuntimeError(
+                        f"Compose service {name!r} unhealthy: {detail}"
+                        + (f"; last output of its command: {output}" if output else "; its command wrote no output")
+                    )
             interval = health.get("start_interval", "5s") if in_start_period else health.get("interval", "30s")
             await asyncio.sleep(_seconds(interval))
 
