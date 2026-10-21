@@ -63,6 +63,7 @@ from nemo_gym.tasks.harbor.manifest import (
     ManifestError,
     check_manifest,
     dataset_digest,
+    dataset_files_digest,
     dataset_toml_digest,
     downstream_digest,
 )
@@ -72,6 +73,7 @@ from nemo_gym.tasks.harbor.materialize import (
     run_config,
     write_rows,
 )
+from nemo_gym.tasks.harbor.parameterized import is_template_folder, render_template_folder
 from nemo_gym.tasks.harbor.prepare_builds import _build_dockerfiles
 from nemo_gym.tasks.harbor.records import read_image_configs
 from nemo_gym.tasks.harbor.registry import (
@@ -348,6 +350,7 @@ def prepare_target(
     target: str,
     *,
     output_root: Path = DEFAULT_OUTPUT_ROOT,
+    render_root: Path | None = None,
     refresh_registry: bool = False,
     exclude: list[str] | None = None,
     only: list[str] | None = None,
@@ -393,6 +396,12 @@ def prepare_target(
     (registry host to username and password, :func:`registry_credentials_from_overrides`) are what the base images
     and the Compose images are read from their registries with; without them a private image stops the
     preparation with the registry's refusal.
+    A template target (:func:`~nemo_gym.tasks.harbor.parameterized.is_template_folder`) is rendered into
+    ``<render_root>/<taskset>/rendered/`` first, ``output_root`` when ``render_root`` is not given. The rendered
+    folder is the dataset root (its ``manifest.toml``, ``compose-images.json`` and ``built-images.json`` live in it),
+    so every command that prepares one template must render it into one place: ``gym dataset validate`` keeps its
+    rows and results under ``results/harbor/validation/`` but renders where ``gym eval run`` does, and an image built
+    for the template under one command is reused, not rebuilt and pushed, under the other.
 
     Before any image is recorded, built or pushed, ``manifest.toml`` beside the task folders is
     reconciled with their digests (:func:`~nemo_gym.tasks.harbor.manifest.check_manifest`): a fetched
@@ -419,6 +428,12 @@ def prepare_target(
     else:
         folder = Path(target).expanduser().resolve()
     taskset = folder.name
+    if folder.is_dir() and is_template_folder(folder):
+        # A parameterized dataset: the template and its rows become plain task folders under the taskset's output
+        # folder, and everything below (manifest, images, loading, rows) reads those files, as the servers will.
+        rendered = render_template_folder(folder, Path(render_root or output_root) / taskset / "rendered")
+        print(f"Rendered {len(iter_task_folders(rendered))} task(s) from {folder} into {rendered}")
+        folder = rendered
     # Dataset-level files (dataset.toml, the recorded image configurations, the built images) live at the
     # dataset root, which is where the loader and the environment server read them from for nested tasks.
     dataset_root = folder.parent if is_task_folder(folder) else folder
@@ -680,12 +695,14 @@ def _dataset_identity(
         hashed = {task.task_id: task.folder_digest for task in loaded}
         toml_digest = dataset_toml_digest(folder.parent)
         patch_digest = downstream_digest(folder.parent)
+        files_digest = dataset_files_digest(folder.parent)
         return Manifest(
             source=LOCAL_SOURCE,
-            digest=dataset_digest(hashed, toml_digest, patch_digest),
+            digest=dataset_digest(hashed, toml_digest, patch_digest, files_digest),
             dataset_toml_digest=toml_digest,
             downstream_digest=patch_digest,
             tasks={name: {"digest": digest} for name, digest in hashed.items()},
+            dataset_files_digest=files_digest,
         )
     if all(digests.get(task.task_id) == task.folder_digest for task in loaded):
         return checked
@@ -1122,6 +1139,9 @@ def validate_target(args: argparse.Namespace, overrides: list[str], *, agent: Ag
         prepared = prepare_target(
             args.target,
             output_root=DEFAULT_OUTPUT_ROOT / "validation",
+            # A template renders where `gym eval run` renders it: one rendered dataset, one set of records (an image
+            # built for it once), while the oracle's rows and results stay under validation/.
+            render_root=DEFAULT_OUTPUT_ROOT,
             exclude=_patterns(args, "exclude_tasks"),
             only=_patterns(args, "only_tasks"),
             build=build_options_from_overrides(overrides),
