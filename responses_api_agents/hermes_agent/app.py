@@ -45,6 +45,7 @@ from nemo_gym.base_responses_api_agent import (
     SimpleResponsesAPIAgent,
 )
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
+from nemo_gym.failure_kinds import AGENT_INVALID_OUTPUT, AGENT_LIMIT, MODEL_REQUEST_ERROR, MODEL_TRANSPORT_ERROR
 from nemo_gym.global_config import get_global_config_dict
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
@@ -305,16 +306,16 @@ class HermesAgent(SimpleResponsesAPIAgent):
         """Read Hermes 26bb847a native result flags and API errors; tested on that pin."""
         error = str(native_result.get("error") or "")
         if error == _TRUNCATION_ERROR or native_result.get("stop_reason") in {"wall_time", "max_turns"}:
-            return AgentOutcome(failure_kind="limit")
+            return AgentOutcome(failure_kind=AGENT_LIMIT)
         if native_result.get("failed"):
             match = _HTTP_STATUS.search(error)
             if match and 400 <= int(match[1]) <= 599:
-                return AgentOutcome(failure_kind="model_request_error", status_code=int(match[1]))
+                return AgentOutcome(failure_kind=MODEL_REQUEST_ERROR, status_code=int(match[1]))
             if error in {"Connection error.", "Connection error", "All connection attempts failed"}:
-                return AgentOutcome(failure_kind="model_transport_error")
+                return AgentOutcome(failure_kind=MODEL_TRANSPORT_ERROR)
             return AgentOutcome(failure_kind="unknown")
         if native_result.get("partial"):
-            return AgentOutcome(failure_kind="invalid_output")
+            return AgentOutcome(failure_kind=AGENT_INVALID_OUTPUT)
         return AgentOutcome(failure_kind="unknown")
 
     config: HermesAgentConfig
