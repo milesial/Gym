@@ -208,6 +208,22 @@ class OpenCodeAgentVerifyResponse(BaseVerifyResponse):
 class OpenCodeAgent(SimpleResponsesAPIAgent):
     """Run OpenCode locally or in a borrowed or agent-owned sandbox session."""
 
+    @staticmethod
+    def _reported_model_error(native_result: Mapping[str, Any], cleanup: dict | None) -> bool:
+        """Recognize a completed APIError, with or without HTTP status; tested on OpenCode 1.17.11.
+
+        Independent worker failures, cleanup errors and timeouts are not provider reports.
+        """
+        return (
+            cleanup is not None
+            and cleanup["return_code"] == 1
+            and not cleanup["timed_out"]
+            and not cleanup["error"]
+            and (native_result.get("error") or {}).get("name") == "APIError"
+            and native_result.get("finish") is None
+            and bool(native_result.get("time", {}).get("completed"))
+        )
+
     def classify_outcome(self, native_result: Mapping[str, Any]) -> AgentOutcome:
         """Read OpenCode 1.17.11's native assistant APIError; tested on that version."""
         error = native_result.get("error") or {}
@@ -682,6 +698,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                     raise RuntimeError(
                         f"Cannot create OpenCode sandbox workdir {workdir}: {workspace.stderr or workspace.stdout}"
                     )
+            state.sandbox_id = sandbox.sandbox_id
             command = _sandbox_prepare_command(workdir, directory, runtime)
             result = await sandbox.exec(command, timeout_s=self.config.sandbox_install_timeout_seconds)
             self._check_sandbox_setup(command, result)
@@ -962,17 +979,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         result = state.session.cleanup
         assistants = [m["info"] for m in export.get("messages", []) if m["info"].get("role") == "assistant"]
         native_result = assistants[-1] if assistants else {}
-        reported_error = (
-            error is None
-            and failure is None
-            and result is not None
-            and result["return_code"] == 1
-            and not result["timed_out"]
-            and not result["error"]
-            and (native_result.get("error") or {}).get("name") == "APIError"
-            and native_result.get("finish") is None
-            and bool(native_result.get("time", {}).get("completed"))
-        )
+        reported_error = error is None and failure is None and self._reported_model_error(native_result, result)
         runtime = state.runtime_info
         if runtime is None:
             state.observations.gaps.append(ObservationGap(code="runtime_info_unavailable"))
@@ -1006,6 +1013,8 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 record.error_type = (
                     "cancelled"
                     if isinstance(failure, asyncio.CancelledError)
+                    else "provider_error"
+                    if reported_error
                     else "server_error"
                     if error or failure
                     else "timeout"
@@ -1021,13 +1030,10 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                         if state.session.owns_sandbox
                         else state.request.sandbox_access.connection.provider_config_ref
                     ),
-                    sandbox_id=(
-                        None
-                        if state.session.owns_sandbox
-                        else str(state.request.sandbox_access.connection.descriptor.get("sandbox_id", "unknown"))
-                    ),
+                    sandbox_id=state.sandbox_id,
                     outcome="timeout" if result["timed_out"] else "failed" if error or failure else "completed",
                     exit_code=result["return_code"],
+                    error_type="process_exit" if reported_error else None,
                 )
             )
         state.observations.gaps.append(
